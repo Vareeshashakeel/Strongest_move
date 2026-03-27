@@ -37,7 +37,9 @@ def parse_block_indices(text):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='VID-Trans-ReID with intermediate cross-camera supervised contrastive learning')
+    parser = argparse.ArgumentParser(
+        description='VID-Trans-ReID with intermediate cross-camera supervised contrastive learning'
+    )
     parser.add_argument('--Dataset_name', required=True, type=str)
     parser.add_argument('--model_path', required=True, type=str, help='ViT pretrained weight path')
     parser.add_argument('--output_dir', default='./output_xcam_intermediate', type=str)
@@ -51,7 +53,12 @@ if __name__ == '__main__':
     parser.add_argument('--xcam_w', default=0.15, type=float)
     parser.add_argument('--xcam_temp', default=0.07, type=float)
     parser.add_argument('--xcam_same_cam_w', default=0.25, type=float)
-    parser.add_argument('--xcam_blocks', default='5,8', type=str, help='0-based block ids from backbone.blocks[:-1]')
+    parser.add_argument(
+        '--xcam_blocks',
+        default='5,8',
+        type=str,
+        help='0-based block ids from backbone.blocks[:-1]'
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -59,8 +66,12 @@ if __name__ == '__main__':
     xcam_blocks = parse_block_indices(args.xcam_blocks)
 
     train_loader, _, num_classes, camera_num, view_num, q_val_loader, g_val_loader = dataloader(
-        args.Dataset_name, batch_size=args.batch_size, num_workers=args.num_workers, seq_len=args.seq_len
+        args.Dataset_name,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        seq_len=args.seq_len
     )
+
     model = VID_Trans(
         num_classes=num_classes,
         camera_num=camera_num,
@@ -78,10 +89,14 @@ if __name__ == '__main__':
     model = model.to(device)
     center_criterion = center_criterion.to(device)
 
-    optimizer_center = torch.optim.SGD(center_criterion.parameters(), lr=0.5)
     optimizer_main = optimizer(model)
     lr_scheduler = scheduler(optimizer_main)
     scaler = amp.GradScaler(enabled=(device == 'cuda'))
+
+    # Only create/use center optimizer if center loss is actually enabled
+    optimizer_center = None
+    if args.center_w > 0:
+        optimizer_center = torch.optim.SGD(center_criterion.parameters(), lr=0.5)
 
     loss_meter = AverageMeter()
     id_meter = AverageMeter()
@@ -105,36 +120,52 @@ if __name__ == '__main__':
 
         for iteration, (img, pid, target_cam, labels2) in enumerate(train_loader, start=1):
             optimizer_main.zero_grad()
-            optimizer_center.zero_grad()
+            if optimizer_center is not None:
+                optimizer_center.zero_grad()
 
             img = img.to(device)
             pid = pid.to(device)
             target_cam = target_cam.to(device)
+
             if target_cam.ndim > 1:
                 seq_cam = target_cam[:, 0].contiguous()
             else:
                 seq_cam = target_cam.contiguous()
+
             labels2 = labels2.to(device)
 
             with amp.autocast(enabled=(device == 'cuda')):
                 score, feat, a_vals, aux = model(img, pid, cam_label=seq_cam)
+
                 attn_noise = a_vals * labels2
                 attn_loss = attn_noise.sum(1).mean()
+
                 loss_id, center = loss_fun(score, feat, pid, seq_cam)
                 xcam_loss = xcam_criterion(aux['xcam_feats'], pid, seq_cam)
-                loss = loss_id + args.center_w * center + args.attn_w * attn_loss + args.xcam_w * xcam_loss
+
+                loss = (
+                    loss_id
+                    + args.center_w * center
+                    + args.attn_w * attn_loss
+                    + args.xcam_w * xcam_loss
+                )
 
             scaler.scale(loss).backward()
+
+            # Main model update
             scaler.step(optimizer_main)
+
+            # Center loss update only if enabled
+            if optimizer_center is not None:
+                for param in center_criterion.parameters():
+                    if param.grad is not None:
+                        param.grad.data *= (1.0 / args.center_w)
+                scaler.step(optimizer_center)
+
             scaler.update()
+
             if ema is not None:
                 ema.update()
-
-            for param in center_criterion.parameters():
-                if param.grad is not None:
-                    param.grad.data *= (1.0 / args.center_w)
-            scaler.step(optimizer_center)
-            scaler.update()
 
             if isinstance(score, list):
                 acc = (score[0].max(1)[1] == pid).float().mean()
@@ -148,6 +179,7 @@ if __name__ == '__main__':
 
             if device == 'cuda':
                 torch.cuda.synchronize()
+
             if iteration % 50 == 0:
                 print(
                     'Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, ID+Tri: {:.3f}, XCam: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}'.format(
@@ -168,10 +200,18 @@ if __name__ == '__main__':
             model.eval()
             rank1, mAP = test(model, q_val_loader, g_val_loader)
             print('CMC: %.4f, mAP : %.4f' % (rank1, mAP))
-            latest_path = os.path.join(args.output_dir, f'{args.Dataset_name}_xcam_intermediate_latest.pth')
+
+            latest_path = os.path.join(
+                args.output_dir,
+                f'{args.Dataset_name}_xcam_intermediate_latest.pth'
+            )
             torch.save(model.state_dict(), latest_path)
+
             if best_rank1 < rank1:
                 best_rank1 = rank1
-                best_path = os.path.join(args.output_dir, f'{args.Dataset_name}_xcam_intermediate_best.pth')
+                best_path = os.path.join(
+                    args.output_dir,
+                    f'{args.Dataset_name}_xcam_intermediate_best.pth'
+                )
                 torch.save(model.state_dict(), best_path)
                 print(f'[OK] Saved best checkpoint: {best_path}')
